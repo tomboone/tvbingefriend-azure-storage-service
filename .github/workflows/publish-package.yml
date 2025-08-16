@@ -1,0 +1,47 @@
+#file: noinspection UndefinedAction,UndefinedParamsPresent
+name: Publish Package to Azure Artifacts
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Set package version in pyproject.toml
+        run: poetry version ${{ env.VERSION }}
+
+      - name: Configure Poetry for Azure Artifacts
+        run: |
+          poetry config repositories.TBC_Feed https://pkgs.dev.azure.com/tomboonedotcom/BingeFriend/_packaging/TBC_Feed/pypi/upload/
+          poetry config http-basic.TBC_Feed __token__ ${{ secrets.AZURE_DEVOPS_PAT }}
+
+      - name: Build package
+        run: poetry build
+
+      - name: Publish package
+        run: poetry publish --repository TBC_Feed --no-interaction
