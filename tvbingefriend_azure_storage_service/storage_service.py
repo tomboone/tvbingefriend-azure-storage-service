@@ -1,22 +1,29 @@
 """Service for interacting with Azure Blob Storage"""
 import json
 import logging
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional
 
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.data.tables import TableServiceClient, TableClient, TableEntity, UpdateMode
 from azure.storage.blob import ContainerClient, BlobClient
 from azure.storage.queue import QueueClient
 
+from .reliability import AzureStorageReliabilityManager
 
-# noinspection PyMethodMayBeStatic
+
+# noinspection PyMethodMayBeStatic,PyUnusedLocal
 class StorageService:
     """Service for interacting with Azure Storage"""
-    def __init__(self, connection_string: str) -> None:
+    def __init__(self, 
+                 connection_string: str,
+                 reliability_manager: Optional[AzureStorageReliabilityManager] = None,
+                 enable_retry: bool = False) -> None:
         """Initialize the Storage Service
 
         Args:
             connection_string (str): Connection string for the storage account.
+            reliability_manager: Optional reliability manager for retry and health monitoring
+            enable_retry: Whether to enable retry functionality (default: False for backward compatibility)
         """
         if connection_string == "UseDevelopmentStorage=true":
             self.connection_string = (
@@ -27,6 +34,78 @@ class StorageService:
             )
         else:
             self.connection_string = connection_string
+        
+        # Optional reliability features
+        self.reliability_manager = reliability_manager
+        self.enable_retry = enable_retry
+        if self.enable_retry and not self.reliability_manager:
+            self.reliability_manager = AzureStorageReliabilityManager(
+                connection_string=self.connection_string
+            )
+
+    @classmethod
+    def create_with_reliability(
+            cls,
+            connection_string: str,
+            max_retry_attempts: int = 3,
+            enable_health_monitoring: bool = True
+    ) -> 'StorageService':
+        """
+        Create a StorageService instance with reliability features enabled.
+
+        Args:
+            connection_string: Azure Storage connection string
+            max_retry_attempts: Maximum number of retry attempts (default: 3)
+            enable_health_monitoring: Whether to enable health monitoring (default: True)
+
+        Returns:
+            StorageService instance with reliability features enabled
+        """
+        reliability_manager = AzureStorageReliabilityManager(
+            connection_string=connection_string
+        )
+        
+        return cls(
+            connection_string=connection_string,
+            reliability_manager=reliability_manager,
+            enable_retry=True
+        )
+
+    def get_reliability_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Get comprehensive reliability status if reliability features are enabled.
+
+        Returns:
+            Dictionary with reliability status, or None if reliability is disabled
+        """
+        if self.reliability_manager:
+            return self.reliability_manager.get_status()
+        return None
+
+    def is_healthy(self, service: Optional[str] = None) -> bool:
+        """
+        Check if Azure Storage services are healthy.
+
+        Args:
+            service: Optional specific service to check ('tables', 'queues', 'blobs')
+
+        Returns:
+            True if healthy, False if unhealthy or reliability features are disabled
+        """
+        if self.reliability_manager:
+            return self.reliability_manager.is_healthy(service)
+        return True  # Assume healthy if no monitoring
+
+    def test_connectivity(self) -> Optional[Dict[str, Any]]:
+        """
+        Test connectivity to all Azure Storage services.
+
+        Returns:
+            Dictionary with connectivity test results, or None if reliability is disabled
+        """
+        if self.reliability_manager:
+            return self.reliability_manager.test_connectivity()
+        return None
 
     def get_queue_service_client(self, queue_name: str) -> QueueClient:
         """Get the queue service client
@@ -70,33 +149,41 @@ class StorageService:
             msg=f"StorageService.upload_queue_message: Attempting to upload message to {queue_name}"
         )
 
-        try:
-            queue_client = self.get_queue_service_client(  # Get queue client
-                queue_name=queue_name  # Queue name
-            )
+        def upload_operation():
+            """Upload message to queue"""
+            queue_client = self.get_queue_service_client(queue_name=queue_name)
+            
+            upload_message = message
+            if isinstance(message, dict):
+                upload_message = json.dumps(message)
 
-        except ValueError as e:  # Catch connection string format error from getter
-            logging.error(
-                msg=f"StorageService.upload_queue_message: Failed to get queue client for {queue_name}: {e}"
-            )
-            raise
-
-        upload_message = message
-        if isinstance(message, dict):
-            upload_message = json.dumps(message)
-
-        try:
-            queue_client.send_message(upload_message)  # Send message to queue
-
+            queue_client.send_message(upload_message)
+            
             logging.info(
                 msg=f"StorageService.upload_queue_message: Successfully uploaded message to {queue_name}"
             )
 
-        except Exception as e:  # Catch any errors
-            logging.error(
-                msg=f"StorageService.upload_queue_message: Failed to upload message to {queue_name}: {e}"
-            )
-            raise
+        # Apply retry logic if enabled
+        if self.reliability_manager and self.enable_retry:
+            @self.reliability_manager.reliable_operation(operation_id="queue_upload")
+            def reliable_upload():
+                """Upload message to queue"""
+                return upload_operation()
+            
+            reliable_upload()
+        else:
+            try:
+                upload_operation()
+            except ValueError as e:  # Catch connection string format error from getter
+                logging.error(
+                    msg=f"StorageService.upload_queue_message: Failed to get queue client for {queue_name}: {e}"
+                )
+                raise
+            except Exception as e:  # Catch any errors
+                logging.error(
+                    msg=f"StorageService.upload_queue_message: Failed to upload message to {queue_name}: {e}"
+                )
+                raise
 
     def get_blob_service_client(self, container_name: str) -> ContainerClient:
         """Get the blob storage container client
@@ -229,7 +316,9 @@ class StorageService:
             msg=f"StorageService.get_entities: Querying entities from table '{table_name}' with filter: "
                 f"'{filter_query or 'All'}'"
         )
-        try:
+
+        def query_operation():
+            """Queries Azure table."""
             table_client: TableClient = self.get_table_service_client().get_table_client(table_name=table_name)
             entities: List[Dict[str, Any]]
 
@@ -243,18 +332,36 @@ class StorageService:
             )
             return entities
 
-        except ResourceNotFoundError:
-            logging.warning(
-                msg=f"StorageService.get_entities: Table '{table_name}' not found while querying entities. "
-                    f"Returning empty list."
-            )
-            return []
-        except Exception as e:
-            logging.error(
-                msg=f"StorageService.get_entities: Failed to query entities from table '{table_name}': {e}",
-                exc_info=True
-            )
-            raise
+        # Apply retry logic if enabled
+        if self.reliability_manager and self.enable_retry:
+            @self.reliability_manager.reliable_operation(operation_id="table_query")
+            def reliable_query():
+                """Queries Azure table."""
+                return query_operation()
+            
+            try:
+                return reliable_query()
+            except ResourceNotFoundError:
+                logging.warning(
+                    msg=f"StorageService.get_entities: Table '{table_name}' not found while querying entities. "
+                        f"Returning empty list."
+                )
+                return []
+        else:
+            try:
+                return query_operation()
+            except ResourceNotFoundError:
+                logging.warning(
+                    msg=f"StorageService.get_entities: Table '{table_name}' not found while querying entities. "
+                        f"Returning empty list."
+                )
+                return []
+            except Exception as e:
+                logging.error(
+                    msg=f"StorageService.get_entities: Failed to query entities from table '{table_name}': {e}",
+                    exc_info=True
+                )
+                raise
 
     def delete_entity(self, table_name: str, partition_key: str, row_key: str) -> None:
         """
@@ -320,7 +427,9 @@ class StorageService:
             raise ValueError("Entity must contain 'PartitionKey' and 'RowKey'.")
 
         logging.debug(msg=f"StorageService.upsert_entity: Attempting to upsert entity into table '{table_name}'")
-        try:
+
+        def upsert_operation():
+            """Upserts an entity."""
             self.create_table_if_not_exists(table_name)
             table_client: TableClient = self.get_table_service_client().get_table_client(table_name)
 
@@ -330,12 +439,23 @@ class StorageService:
                     f"into table '{table_name}'."
             )
 
-        except Exception as e:
-            logging.error(
-                msg=f"StorageService.upsert_entity: Failed to upsert entity into table '{table_name}': {e}",
-                exc_info=True
-            )
-            raise
+        # Apply retry logic if enabled
+        if self.reliability_manager and self.enable_retry:
+            @self.reliability_manager.reliable_operation(operation_id="table_upsert")
+            def reliable_upsert():
+                """Upserts an entity."""
+                return upsert_operation()
+            
+            reliable_upsert()
+        else:
+            try:
+                upsert_operation()
+            except Exception as e:
+                logging.error(
+                    msg=f"StorageService.upsert_entity: Failed to upsert entity into table '{table_name}': {e}",
+                    exc_info=True
+                )
+                raise
 
     def create_table_if_not_exists(self, table_name: str):
         """
