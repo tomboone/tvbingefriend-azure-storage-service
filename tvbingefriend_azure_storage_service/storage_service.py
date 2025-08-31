@@ -290,35 +290,47 @@ class StorageService:
             )
             raise ValueError(f"Invalid storage connection string format for Table Service: {e}") from e
 
-    def get_entities(self, table_name: str, filter_query: str | None = None) -> List[Dict[str, Any]]:
+    def get_entities(self, table_name: str, filter_query: str | None = None, 
+                    offset: int | None = None, limit: int | None = None) -> List[Dict[str, Any]]:
         """
-        Retrieves entities from a specified Azure Table, with an optional filter.
+        Retrieves entities from a specified Azure Table, with optional filtering and pagination.
 
         Args:
             table_name: The name of the table to query.
             filter_query: An OData filter string to apply to the query.
                           If None, all entities in the table are returned.
                           Example: "PartitionKey eq 'some_key'"
+            offset: Number of entities to skip (for pagination). If None, no offset is applied.
+            limit: Maximum number of entities to return (for pagination). If None, no limit is applied.
 
         Returns:
             A list of dictionaries, where each dictionary is an entity.
             Returns an empty list if the table does not exist.
 
         Raises:
-            ValueError: If table_name is invalid.
+            ValueError: If table_name is invalid or offset/limit are negative.
             azure.core.exceptions.ServiceRequestError: For network or other service issues.
         """
         if not table_name:
             logging.error(msg="StorageService.get_entities: Table name cannot be empty.")
             raise ValueError("Table name cannot be empty.")
+            
+        # Validate pagination parameters
+        if offset is not None and offset < 0:
+            logging.error(msg="StorageService.get_entities: Offset cannot be negative.")
+            raise ValueError("Offset cannot be negative.")
+            
+        if limit is not None and limit < 0:
+            logging.error(msg="StorageService.get_entities: Limit cannot be negative.")
+            raise ValueError("Limit cannot be negative.")
 
         logging.debug(
             msg=f"StorageService.get_entities: Querying entities from table '{table_name}' with filter: "
-                f"'{filter_query or 'All'}'"
+                f"'{filter_query or 'All'}', offset: {offset}, limit: {limit}"
         )
 
         def query_operation():
-            """Queries Azure table."""
+            """Queries Azure table with optional pagination."""
             table_client: TableClient = self.get_table_service_client().get_table_client(table_name=table_name)
             entities: List[Dict[str, Any]]
 
@@ -327,8 +339,22 @@ class StorageService:
             else:
                 entities = list(table_client.list_entities())
 
+            # Apply pagination if offset or limit are specified
+            total_entities = len(entities)
+            start_idx = offset or 0
+            
+            if start_idx >= total_entities:
+                # Offset beyond available data
+                entities = []
+            else:
+                end_idx = total_entities
+                if limit is not None:
+                    end_idx = min(start_idx + limit, total_entities)
+                entities = entities[start_idx:end_idx]
+
             logging.info(
-                msg=f"StorageService.get_entities: Retrieved {len(entities)} entities from table '{table_name}'."
+                msg=f"StorageService.get_entities: Retrieved {len(entities)} entities from table '{table_name}' "
+                    f"(total: {total_entities}, offset: {offset}, limit: {limit})."
             )
             return entities
 
