@@ -31,9 +31,9 @@ class AzureStorageHealthMonitor:
         self.logger = logger or getLogger(__name__)
         
         # Cache for health check results
-        self._last_health_check = None
+        self._last_health_check: Optional[datetime] = None
         self._health_cache_ttl = timedelta(minutes=5)
-        self._cached_health_status = None
+        self._cached_health_status: Optional[Dict[str, Any]] = None
     
     def test_table_connectivity(self, timeout: float = 10.0) -> Dict[str, Any]:
         """Test connectivity to Azure Table Storage.
